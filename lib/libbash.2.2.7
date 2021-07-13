@@ -1,0 +1,735 @@
+#!/bin/bash
+################################################################################
+#
+#       $Header: /beheer/sysmgmt/lib/RCS/functions.lib,v 1.1 2009/06/11 11:36:53 oracle Exp oracle $
+#
+#         Name : libbash.sh
+#        About : generic bash functions libraqry 
+#
+#     $Revision: 2.0.0$
+#
+#   Author(s)  : Gert J. Willems <gjwillems@gmail.com>
+#
+#   Parameters : [MANDATORY!]
+#
+#                [OPTIONAL]
+#
+# Dependencies : 
+#
+# ------------------------------------------------------------------------------ 
+# ============================================================================== 
+# History
+# Date     Rev   Author      What?
+# -------- ----- ----------- ----------------------------------------------------
+# 20151130 1.0   gjwillems   created
+# 20151203 1.1   gjwillems   catch_if_debug
+# 20161026 1.2   gjwillems   lower function added
+# 20170207 1.3.0 gjwillems   cleanup; comments; functions added etc.
+# 20170207 1.3.1 gjwillems   merged with different shell lib
+# 20170208 1.4.1 gjwillems   hr function added; bashinit added: determines
+#                            the environment i.e. postgres or oracle
+# 20170208 1.5.1 gjwillems   redirect added (redirect.pl) set_db for setting 
+#                            postgres database 
+# 20170227 1.6,1 gjwillems   userlist function added
+# 20170301 1.6,2 gjwillems   merged with other libbash.sh instances 
+# 20170339 1.7.2 gjwillems   instr function added
+# 20170510 1.8.2 gjwillems   purge function added
+# 20170608 1.9.2 gjwillems   syslog logger added to the error_handler function
+# 20170621 2.0.0 gjwillems   Oracle and Postgres functions placed in specific
+#                            libraries
+# 20170807 2.1.0 gjwillems   purge function improved
+# 20170823 2.2.0 gjwillems   nmon wrapper function added
+# 20170823 2.2.1 gjwillems   list function added
+# 20180103 2.2.2 gjwillems   vs "vi shell" function added
+# 20180509 2.2.3 gjwillems   all _self_ SHOULD be LOCAL!
+# 20180706 2.2.4 gjwillems   catch_if_debug new line options added
+# 20181116 2.2.5 gjwillems   libgeneric.sh added
+# 20181122 2.2.6 gjwillems   purge improved with -n switch
+# 20200218 2.2.7 gjwillems   write function added
+#
+# ------------------------------------------------------------------------------
+#                        COPYRIGHT (C) 2000-2018, ITASSIST 
+################################################################################
+# set -xv
+
+# ====== Aliasses  =============================================================
+# ---- Local variables and initialisation --------------------------------------
+#
+TS=$(date +"%T %F")
+
+source "${GLOBAL_LIB:-/data/shared/global/lib}/libgeneric.sh"
+
+# ==============================================================================
+# show version information of this library
+# ---------------------------V--------------------------------------------------
+function libbash_version() { ## print the current libbash version
+   local _self_=${FUNCNAME[0]}
+   local LIB="libbash.sh"
+   local LB_REV="$Revision: 2.2.7 $" 
+   local LB_REV_DATE="Tue Feb 18 09:39:45 CET 2020"
+
+   printf "%s revision %s build: %s\n" "${LIB}" "${LB_REV}" "${LB_REV_DATE}"
+}
+
+# ====== Functions =============================================================
+# 34567890123456789012345678
+# ---------------------------V--------------------------------------------------
+function usage() {           ## libbash.sh usage notes
+    printf "\nusage:\n"
+    libbash_version
+    printf "\tsource this library with this call:\n"
+    printf "\t. ${LIB} from within your script or in $HOME/.bashrc\n\n"
+    return 1
+}
+
+# ==============================================================================
+#   iself_=${FUNCNAME[0]}
+# bash init set the specific enviroment Oracle or Postgres
+# ---------------------------V--------------------------------------------------
+function _bashinit_() {      ## init the bashlib
+   local _self_=${FUNCNAME[0]}
+
+   ctr=0
+   # We base the environment on the existance of the TAB files in /etc
+   if [ -s /etc/oratab ]; then
+      export ORATAB="/etc/oratab"
+      ((ctr+=1))
+   fi
+   if [ -s /etc/pgtab ]; then
+      export PGTAB="/etc/pgtab"
+      ((ctr+=2))
+   fi
+   case ${ctr} 
+   in
+      0) ENV_DESC="No Oracle and PostgreSQL found" ;; 
+      1) ENV_DESC="Oracle Database Server" ;; 
+      2) ENV_DESC="PostgreSQL Database Server" ;; 
+      3) ENV_DESC="Oracle and PostgreSQL Database Server" ;; 
+   esac
+   export ENV_DESC
+}
+
+# ==============================================================================
+# check routine "is"
+# ---------------------------V--------------------------------------------------
+function is() {              ## get a true or false for specified DB Vendor
+   local _self_=${FUNCNAME[0]}
+   system=$(lower "${1}")
+   
+   case ${system}
+   in
+        oracle) [[ ! -z ${ORATAB:-/etc/oratab} ]] && return 0 ;;
+      postgres)	[[ ! -z ${PGTAB:-/etc/pgtab}  ]] && return 0 ;;
+           prd) if [ ! -z ${PGTAB:-/etc/pgtab}  ]; then 
+                   grep -qw prd ${PGTAB:-/etc/pgtab} 
+                   if [ $? -eq 0 ]; then
+                      return 0
+                   else
+                      return 1
+                   fi
+                fi ;;
+   esac
+
+   printf "Sorry, this is a ${ENV_DESC}\n"
+   return 1
+}
+
+# ==============================================================================
+# ---- Messages ----------------------------------------------------------------
+# ---------------------------V--------------------------------------------------
+#
+function init_mgs() {        ## message and error template strings
+    MSG00="%s: INFO, <text>\n"
+    ERR00="%s: ERROR, unable to create directory [%s]\n"
+    ERR01="%s: ERROR, file not found [%s]\n"
+    ERR50="%s: ERROR - PostgreSQL: [%s]\n"
+    ERR98="%s: ERROR - file backup failed, [%s]\n"
+    ERR99="%s: ERROR - this is the wrong server [%s]\n"
+}
+
+# ==============================================================================
+# log a message 
+# ---------------------------V--------------------------------------------------
+function log() {             ## log a line to STDOUT
+   # set -xv
+   msg="${1}"
+   nl=${2} # newline ?
+
+   [[ -z "${nl}" ]] && printf "INFO - %s" "${msg}" && return
+
+   printf "INFO - %s\n" "${msg}"
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function logts() {           ## log a line to STDOUT with timestamp
+   # set -xv
+   msg="${1}"
+   nl=${2} # newline ?
+   ts=$(date +"%d-%m-%Y %H:%M:%S.%6N")
+
+   [[ -z "${nl}" ]] && printf "%s INFO - %s" "${ts}" "${msg}" && return
+
+   printf "[%s] INFO - %s\n" "${ts}" "${msg}"
+}
+
+# ==============================================================================
+# simple error handling routine 
+# ---------------------------V--------------------------------------------------
+function error_handler() {   ## error_handler 
+   message="${1}"
+   syslog=${2:-0}
+   out "${message}" "ERROR"
+   [[ ${syslog} -eq 1 ]] && logger "ERROR - ${message}"
+   exit 1
+}
+
+# ==============================================================================
+# simple debug/trace routine to show internal messages
+# ---------------------------V--------------------------------------------------
+function catch_if_debug() {  ## debug message handler
+   [[ ${SCRIPT_DEBUG} == 0 || -z ${SCRIPT_DEBUG} ]] && return
+   _caller_=${FUNCNAME[1]}
+   msg="${1}"
+   local nlb
+   local nla
+   local nlv="${2}"
+   case ${nlv}
+   in
+      1) nlb="\n" ;;
+      2) nla="\n" ;;
+      3) nlb="\n"
+         nla="\n" ;;
+   esac
+   ts=$(date +"%Y%m%d%H%M%S")
+
+   >&2 printf "${nlb}[%s] DEBUG >> caller=[%s]: %s${nla}\n" "${ts}" \
+              "${_caller_}" "${msg}"
+   nlv=0
+}
+
+
+# ===== pathmunge =============================================================
+# from /etc/functions
+# ---------------------------V--------------------------------------------------
+function pathmunge() {       ## modify PATH settings
+   # check if the directory exists...
+   [[ ! -d ${1} ]] && return
+ 
+   if ! echo $PATH | /bin/egrep -q "(^|:)$1($|:)" 
+   then 
+      if [ "$2" = "after" ]
+      then
+         export PATH=$PATH:$1
+      else
+         export PATH=$1:$PATH
+      fi
+   fi
+}
+
+
+# ==============================================================================
+# search for a process or series of, Grep ProceSs; takes a max of 5 parameters
+# ---------------------------V--------------------------------------------------
+function gps() {             ## grep processes based on a max of 5 search arguments
+    printf "\n";
+    ps -edalf | head -1;
+    case $# in
+        1)
+            ps -edalf | grep "${1}" \
+                      | egrep -v "grep|ps -edalf" ;;
+        2)
+            ps -edalf | egrep "${1}|${2}" \
+                      | egrep -v "grep|ps -edalf" ;;
+        3)
+            ps -edalf | egrep "${1}|${2}|${3}" \
+                      | egrep -v "grep|ps -edalf" ;;
+        4)
+            ps -edalf | egrep "${1}|${2}|${3}|${4}" \
+                      | egrep -v "grep|ps -edalf" ;;
+        5)
+            ps -edalf | egrep "${1}|${2}|${3}|${4}|${5}" \
+                      | egrep -v "grep|ps -edalf" ;;
+    esac;
+    printf "\n"
+}
+
+# ==============================================================================
+# Basic and rudimentary trace routine
+# parameters: message 2b displayed
+# ---------------------------V--------------------------------------------------
+function wTrace() {          ## write trace messages, call from a bash script
+   eval ${gDebug}
+   if [ ${TraceEnabled} ]
+   then
+      TraceMessage="${1}"
+      TimeStamp=$(date +"%Y-%m-%d %H:%M:%S.%N")
+      printf "%s-TRC: ${TraceMessage}\n" "${TimeStamp}"
+   fi
+}
+
+# ==============================================================================
+# Basic and rudimentary error handler
+# parameters: message 2b displayed
+# ---------------------------V--------------------------------------------------
+function throwException() {  ## report a problem and show usage (?)
+   wTrace "exception found: argument: [${1}]"
+   usage "${1}"
+}
+
+
+# ====== test routine =========================================================
+# test getopts functionality and show the use of the wTrace function call
+#
+# ---------------------------V--------------------------------------------------
+function tf() {              ## test function show use of trace functionality
+   shiftc=0
+   _SELF=tf
+   TraceEnabled=1
+
+   wTrace "call ${_SELF}(): argc=[$#]"
+
+   while getopts "ahl" ARGV   
+   do
+      case ${ARGV}
+      in
+         a) echo "option ${ARGV} specified" 
+            ;;
+      esac  
+   done
+
+   if [ $# -gt 1 ]; then
+      ((shiftc=$# - 1))
+      shift ${shiftc}
+   fi
+
+   wTrace "in ${_SELF}(): Argument remaining = ${1}\n"
+}
+
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+function getpassword() {     ## calls to invoke the GNU Password Control program
+   username=$1
+   service=$2
+ 
+   retrycnt=3
+   idx=1
+
+   while [ $idx -ne $retrycnt ]
+   do
+      ssapdrow=$(${TPS_HOME}/bin/tpsctl -u ${username} -s ${service})
+      if [ $? -eq 0 ]; then
+         printf ${ssapdrow}
+         return 0
+      fi
+      ((idx+=1))
+   done
+   printf "FAILED"
+   return 1
+}
+
+# ==============================================================================
+#
+# ---------------------------V--------------------------------------------------
+# --reset database accounts
+function pwdreset() {        ## Reset a oracle password with the one in GPS
+    local _self_=${FUNCNAME[0]}
+
+   [[ -z ${1} ]] && [[ -z ${2} ]] && echo usage: ${_self_} [username] [database] && return 1
+   printf "Password reset for user: [${1}]\n"
+   dwp=$(getpassword ${1} ${2} 2>/dev/null)
+   sqlplus -s /nolog << EOS
+   connect / as sysdba
+   alter user $1 identified by "$dwp"
+/
+EOS
+}
+
+
+# ==============================================================================
+# user friendly disk free output
+# ---------------------------V--------------------------------------------------
+function dfh() {             ## user friendly df output
+   lns=$(df -h | wc -l)
+   ((lns=lns-1))
+   # printf "[$lns]\n"
+   printf "\n%-60.60s %10.10s %10.10s %10.10s %10.10s %-7.7s %2s\n" $(df -h|head -1)
+   hr 60; hr 10; hr 10; hr 10; hr 10; hr 35 1
+   printf "%-60.60s %10.10s %10.10s %10.10s %10.10s %-40.40s\n" $(df -h|tail -${lns})
+   printf "\n"
+}
+
+
+# ==============================================================================
+# List all functions in $0 (this lib)
+# ---------------------------V--------------------------------------------------
+function libbash() {         ## Show all the defined functions in libbash.sh
+   echo
+   libbash_version
+   printf "\nFunction          Description"
+   printf "\n--------          ----------------------------------------------------\n"
+
+   grep -i ^"function [a-z]" "${GLOBAL_LIB}/libbash.sh" | \
+   egrep -v "^EOS|^TS|^declare" | \
+   sed 's/function //g' | \
+   sed 's/()//g'        | \
+   sed 's/{/ /g'        | \
+   sort 
+   echo 
+}
+
+# ==============================================================================
+# Get the tomcat version
+# ---------------------------V--------------------------------------------------
+function tomcatversion() {   ## show the actual Tomcat version
+   echo
+   tcjar="/usr/share/tomcat/lib/catalina.jar"
+   if [ -s ${tcjar} ]; then
+      java -cp ${tcjar} org.apache.catalina.util.ServerInfo
+   else 
+      echo No tomcat server found.
+      echo
+   fi
+}
+
+# ==============================================================================
+# print a string in lowercase
+# ---------------------------V--------------------------------------------------
+function lower() {           ## print a string in lowercase
+   up="${1}"
+   low=$(printf "${up}"|tr 'A-Z' 'a-z')
+   printf "${low}"
+}
+
+# ==============================================================================
+# print a string in uppercase
+# ---------------------------V--------------------------------------------------
+function upper() {           ## print a string in uppercase
+   low="${1}"
+   up=$(printf "${low}"|tr 'a-z' 'A-Z')
+   printf "${up}"
+}
+
+# ==============================================================================
+# simple output function with time and logging and quiet option
+#   LOGFILE => define in the calling routine, defaults to /tmp/default.log
+#   QUIET   => define in the calling routine, defaults to off
+#   LOGGING => define in the calling routine, NO default
+# ---------------------------V--------------------------------------------------
+function out() {             ## message print and logging function
+   msg="${1}"
+   mtp="${2:-"INFO"}"
+   #ts=$(date +"%Y%m%d%H%M%S")
+   ts=$(date +"%d-%m-%Y %H:%M:%S.%6N")
+   lf="${LOGFILE:-/tmp/default.log}"   
+ 
+   if [ ${LOGGING:-0} -eq 1 ]; then
+      if [ ${QUIET:-0} -eq 0 ]; then
+         printf "%s %5s - %s\n" "${ts}" "${mtp}" "${msg}" | tee -a ${lf}
+      else
+         printf "%s %5s - %s\n" "${ts}" "${mtp}" "${msg}" >> ${lf} 2>&1
+      fi
+   else
+      printf "%s %5s - %s\n" "${ts}" "${mtp}" "${msg}" 
+   fi
+   return 
+}
+
+# ==============================================================================
+# simple output function with time and logging and quiet option
+# specific version when using redirect.pl routine in case date/timestamp is
+# already printed
+# ---------------------------V--------------------------------------------------
+function rd_out () {         ## redirect message routine catch uncontrolled output
+   msg="${1}"
+   lf="${LOGFILE:-/tmp/default.log}"   
+   if [ ${LOGGING:-0} -eq 1 ]; then
+      if [ ${QUIET:-0} -eq 0 ]; then
+         printf "%s\n" "${msg}" | tee -a ${lf}
+      else
+         printf "%s\n" "${msg}" >> ${lf} 2>&1
+      fi
+   else
+      printf "%s\n" "${msg}" 
+   fi
+   return 
+}
+
+# ==============================================================================
+# display the active crontab entries
+# ---------------------------V--------------------------------------------------
+function ace() {             ## print the active crontab entries
+   tf="/tmp/.$$_ac_cache"
+   lc=1
+   crontab -l | egrep -v "^#|^$" > ${tf}
+
+
+   cat ${tf} | while read cline
+   do
+      if [ $lc -eq 1 ]; then
+         printf "\nActive Crontab Entries:\n"
+         printf "+---------------------+\n"
+      fi
+      printf "%s\n" "${cline}"
+      ((lc+=1))
+   done
+   echo
+}
+
+# ==============================================================================
+# print a horizontal ruler
+# arg1 length
+# arg2 newline 0 false 1 true
+# arg3 ruler delimiter default '+'
+# ---------------------------V--------------------------------------------------
+function hr() {              ## print a horizontal ruler to stdout
+   len=${1}
+   nl=${2:-0}
+   delim=${3:-"+"}
+
+   ((len=len-2))
+
+   printf "${delim}"
+   for i in $(seq 1 ${len})
+   do
+      printf "%b" "\055"
+   done
+   printf "${delim}"
+
+   [[ ${nl} -eq 0 ]] && printf " "
+   [[ ${nl} -eq 1 ]] && printf "\n"
+}
+
+
+# ==============================================================================
+# show user information based on /etc/passwd/ & /etc/groups
+# id like output:
+# uid=600(beheer) gid=1000(dbb) groups=1000(dbb),0(root),26(postgres),
+# ---------------------------V--------------------------------------------------
+function userlist() {        ## print an account id from /etc/passwd & /etc/group
+   uname=${1}
+
+   grep -wq ^${uname} /etc/passwd
+   [[ $? -eq 1 ]] && echo user ${uname} does not exists && return 1
+   ulist=$(grep -w ^${uname} /etc/passwd)
+   glist=$(grep -w ${uname} /etc/group|awk -F: '{ printf "%s:%s\n",$3,$1 }' | sort -n)
+   gid=$(printf "${ulist}"|cut -d ':' -f 4)
+   # userinfo
+   uinfo="uid="$(printf "$ulist"|cut -d ':' -f 3)
+   uinfo="${uinfo}("$(printf "${ulist}"|cut -d ':' -f 1)")"
+   # primary GROUP
+   uinfo="${uinfo} gid=${gid}("$(grep -w ${gid} /etc/group|cut -d ':' -f 1)")"
+   uinfo="${uinfo} groups=${gid}("$(grep -w ${gid} /etc/group|cut -d ':' -f 1)")"
+   
+   # supplementary GROUPS 
+   for group in $(printf "%s\n" "${glist}")
+   do
+      gid=$(printf "${group}"|cut -d ':' -f 1)
+      gname=$(printf "${group}"|cut -d  ':' -f 2)
+      uinfo="${uinfo},${gid}(${gname})"
+   done
+   echo $uinfo
+}
+
+# ==============================================================================
+# instr <string> <char-to-find> return position of 2nd or 0 if not found
+# ---------------------------V--------------------------------------------------
+function instr() {           ## find char in string and return position 0 if not
+   str="$1"
+   chr="$2"
+   i=0
+   for c in $(grep -o . <<< "${str}")
+   do
+      ((i+=1))
+      [[ ${chr} == ${c} ]] &&  printf ${i} && return 0
+   done
+   printf 0 
+   return 1
+}
+
+# ==============================================================================
+# substr <string> from-pos [length] returns substr from string
+# ---------------------------V--------------------------------------------------
+function substr() {          ## returns a substring from <str> <@pos> [<len>]
+   str="$1"
+   strlen=${#str}
+   pos="$2"
+   len="${3:-${strlen}}"
+   ((arv=len+pos-1))
+   i=0
+   subs="" 
+ 
+   [[ ${strlen} -lt ${pos} ]] && return 99
+
+   for c in $(grep -o . <<< "${str}")
+   do
+      ((i+=1))
+      if [ ${i} -ge ${pos} ]; then
+         subs="${subs}${c}"
+      fi
+      if [ ${arv} -eq ${i} ]; then
+         printf "${subs}"
+         return 0
+      fi
+   done
+
+   printf "${subs}"
+   return 0
+}
+
+# ------------------------------------------------------------------------------ 
+# Description: this function searches for unique file names with the following
+# naming convention: <name>.<ext> and all have a session-id suffix e.g.
+# sqlsh_oracle.ccl.88936
+# ------------------------------------------------------------------------------ 
+function purge () {
+   local _self_=${FUNCNAME[0]};
+
+   local purged=0
+   local dn=0;   # done
+   local tdn=0;  # total done
+   local td=0;   # files 2do
+   local verbose=0;
+   local noexec=0;
+   local OPTIND fargv keep k v noexec n;
+
+   while getopts "k:vn" fargv; do
+      case ${fargv} in 
+         k) keep=${OPTARG} ;;
+         n) noexec=1 ;;
+         v) verbose=1 ;;
+      esac;
+   done;
+
+   shift $((OPTIND-1));
+   [[ -z "${keep}" ]] && keep=5;
+   [[ ${verbose} -eq 1 ]] && printf "${_self_} - keep is set to [${keep}]\n"
+
+   f=$(ls -tr1 | awk -F. '{ printf "%s.%s\n", $1, $2 }' | sort -u);
+
+   for fn in $(printf "%s\n" "${f}");
+   do
+      cnt=$(ls -tr1 ${fn}.[0-9][0-9][0-9]* wc -l 2>/dev/null | wc -l);
+      if [ ${cnt} -gt 0 ]; then
+         [[ ${verbose} -eq 1 ]] && printf "${_self_} - file history for: ${fn} ${cnt} file(s)\n";
+         ((td=cnt - keep));
+         [[ ${verbose} -eq 1 ]] && printf "${_self_} - todo = [${td}] keep = [${keep}] file count = [${cnt}]\n";
+         for file in $(ls -tr1 ${fn}.[0-9][0-9][0-9]* 2>/dev/null);
+         do
+            if [ ${dn} -lt ${td} ]; then
+               ((tdn+=1));
+               [[ ${verbose} -eq 1 ]] && printf "${_self_} - %5.5d %s\n" ${tdn} ${file};
+               [[ ${noexec} -eq 0 ]] && rm -i -f ${file};
+               purged=1
+            fi;
+            ((dn+=1));
+         done;
+      fi;
+      dn=0;
+   done;
+
+   [[ ${purged} -eq 0 ]] && printf "no files to purge\n" && return 0
+
+   printf "${_self_} - ${tdn} files purged.\n"
+   return 0
+}
+
+# ==============================================================================
+# create a symlink to the new version of libbash.<version>
+# ---------------------------V--------------------------------------------------
+function relink_libbash() {  ## create s symlink libbash.sh -> libbash.<rev> 
+   local _self_=${FUNCNAME[0]}
+
+   [[ ! -f libbash.sh ]] && printf \
+      "usage: ${_self_}, cd to the location of libbash.sh and re-exec\n" \
+      && return 1
+
+   libfile=$(ls -l libbash.sh | awk '{ print $11 }')
+   rev=$(grep "^export LB_REV=" libbash.sh | \
+       awk -F: '{ printf "%s",$2}' | \
+       sed 's/ //g' | \
+       sed 's/\$"//g') 
+   
+   mv -v ${libfile} libbash.${rev}
+   ln -sfv libbash.${rev} libbash.sh 
+}
+
+# ==============================================================================
+# nmon wrapper
+# ---------------------------V--------------------------------------------------
+function nmon() {            ## nmon with diskgroup file and default switches
+   local _self_=${FUNCNAME[0]}
+
+   nmon=${GLOBAL_BIN}/nmon
+   diskgroups=${LOCAL_CNF}/diskgroups.conf
+   export NMON=ckmgnV
+
+   [[ ! -s ${diskgroups} ]] && printf "${_self_} INFO - no diskgroups defined\n" \
+      && printf "Press Enter " && read dummy && ${nmon}  && return 0
+
+   ${nmon} -g ${diskgroups} 
+
+   return 0
+}
+
+# ==============================================================================
+# list function to print a list of elements separeted by , or :
+# ---------------------------V--------------------------------------------------
+function list () {
+   local buffer="${1}"
+   if [[ ${buffer} =~ .*,.* ]]
+   then
+      printf "%s\n" $(echo ${buffer} | sed 's/,/ /g') 
+   elif [[ ${buffer} =~ .*:.* ]]
+   then
+      printf "%s\n" $(echo ${buffer} | sed 's/,/:/g') 
+   fi
+}
+
+
+# ==============================================================================
+# start a vim session with the Bash Template in $BT
+# ---------------------------V--------------------------------------------------
+function vs() {
+   local _self_=${FUNCNAME[0]}
+   name="${1}"
+
+   [[ -s ${name} ]] && vi ${name} && return 0
+   [[ ! -s ${BT} ]] && vi ${name} && return 0
+
+   date="$(date)"
+   sdate=$(date +"%Y-%m-%d") 
+   author=$(who am i | cut -d ' ' -f 1)
+
+   cat ${BT} | sed "s/NAME/${name}/g" \
+             | sed "s/DATE/${date}/g" \
+             | sed "s/00-00-0000/${sdate}/g" \
+             | sed "s/AUTHOR/${author}/g" > ${name}
+
+   vi ${name}
+}
+
+# ==================================================================================================
+# simple output function
+# --------------------------------------------------------------------------------------------------
+function write () {
+   local _self_="${FUNCNAME[0]}"
+   message="${1}"
+   type="${2}"
+   ts=$(date +"%Y%m%d%H%M%S")
+   printf "%s %s %s - %s\\n" "${ts}" "${mod}" "${type:-INFO}" "${message}"
+   return 0
+}
+
+# ==============================================================================
+# Call then init proc
+_bashinit_
+# ---------------------------V--------------------------------------------------
+# ==============================================================================
+# export the functions
+# ---------------------------V--------------------------------------------------
+_export_functions_
+# ----- enf of functions.lib ------------------------------------------------------

@@ -1,0 +1,58 @@
+#!/bin/bash
+################################################################################
+#
+#       $Header: /beheer/sysmgmt/lib/RCS/lingeneric.sh,v 1.0 
+#
+#         Name : libgeneric.sh
+#        About : generic functions libraqry
+#
+#     $Revision: 1.0$
+#
+#   Author(s)  : Gert J. Willems <gjwillems@gmail.com>
+#
+#   Parameters : [MANDATORY!]
+#
+#                [OPTIONAL]
+#
+# Dependencies :
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+# History
+# Date     Rev   Author      What?
+# -------- ----- ----------- ----------------------------------------------------
+# 20181116 1.0   gjwillems   created
+#
+# ------------------------------------------------------------------------------
+#                        COPYRIGHT (C) 2000-2017, ITASSIST
+################################################################################
+# set -xv
+
+# ====== Aliasses  =============================================================
+# ---- Local variables and initialisation --------------------------------------
+#
+TS=$(date +"%T %F")
+
+# ==============================================================================
+# show version information of this library
+# ---------------------------V--------------------------------------------------
+function libgeneric_version() { ## print the current library version
+   local _self_=${FUNCNAME[0]}
+   local LIB="libgeneric.sh"
+   local LB_REV="$Revision: 1.0 $"
+   local LB_REV_DATE="Fri Nov 16 10:48:11 CET 2018"
+
+   printf "%s revision %s build: %s\n" "${LIB}" "${LB_REV}" "${LB_REV_DATE}"
+}
+
+# ==============================================================================
+# export all the functions for usage in subshells
+# ---------------------------V--------------------------------------------------
+function _export_functions_() {
+   local _self_="${FUNCNAME[0]}"
+   for f in $(typeset | fgrep '()'|grep "^[a-z]"|cut -f1 -d ' ')
+   do
+      typeset -fx ${f}
+   done
+}
+
