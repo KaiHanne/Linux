@@ -1,0 +1,572 @@
+#!/bin/bash
+# ==================================================================================================
+#
+#      File: ca_stats
+#      Date: Wed Nov  6 12:41:07 CET 2019
+#      What: show cloud adapter statics from /var/log/cloudadapter/tunnel.log
+#       Who: Gert J. Willems
+#
+# ==================================================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -------------------------------------------------------------------
+# 06-11-2019 0.1   gjwillems     created
+# 06-11-2019 0.2   gjwillems     csv creation added
+# 07-11-2019 0.3   gjwillems     cross ref to Postgres added ; brief option added 
+# 12-11-2019 0.4   gjwillems     redesign: get_stats function with optional hour specification
+#                                to generate check_mk statistics; cross ref with database only on
+#                                the daily stats.
+# 13-11-2019 0.5   gjwillems     database counts are now grouped by the STATUS attribute
+# 14-11-2019 0.6   gjwillems     extended check added (i.c.w. -C option)
+# 02-12-2019 0.7   gjwillems     some minor improvements; counts without server
+# 03-12-2019 0.8   gjwillems     check is brk or bag messages have a delay of >1 day = warning or 
+#                                >2 days = critical
+# 05-12-2019 0.9   gjwillems     granularity of delay check changed from day to hour
+# 10-12-2019 1.0   gjwillems     delay specifiaction in hours
+# 18-12-2019 1.1   gjwillems     location of output csv changed to non-NFS partition
+#                                -f option added to overrule default tunnel.log
+#                                ca_stats.conf added for PORT, USER etc configuration
+# 07-01-2020 1.2   gjwillems     CSV bug fixed: only create when using -x switch
+#                                CSV file suffixed with username
+#                                -w weekno flag added
+#                                -f -w combo results in weekno of specified file date
+# 03-02-2020 1.3   gjwillems     BUGFIX: date +%H has a 0 prefix and results in a base error when
+#                                performing arithmic: date +%k
+# 04-02-2020 1.4   gjwillems     BUGFIX: check_delay ignores 'soort-not-found' in tunnel.log
+#                                which results in a date error. +. check previous tunnel.log also
+# 12-02-2020 1.5   gjwillems     invalid date message -> bug fixed invalid dalay algorithm -> fixed
+# 15-04-2020 1.6   gjwillems     if the <YYYYMMDD##>_brk_response.xml file existst check if there 
+#                                messages delivered for this day, if not raise check_mk OK
+# 17-04-2020 1.7   gjwillems     BUG fix: the request and response files are always of yesterday's 
+#                                date, so we 1 check yesterday's response file and then the one 
+#                                before yesterday.
+# 12-07-2021 1.8   gjwillems     extra check if tunne.log, previous tunnel.log.<date>, adapter.log 
+#                                and previous adapter.log.<date> have a size of 0. In that case
+#                                the cloudadapters needs to be restarted.
+#
+# ==================================================================================================
+# set -xv
+# --------------------------------------------------------------------------------------------------
+mod=$(basename ${0})
+path=$(dirname ${mod})
+rev="1.8"
+rev_date="Mon Jul 12 10:32:26 CEST 2021"
+
+SCRIPT_DEBUG=0
+BRIEF=0
+CSV=0
+CC=0
+EXCHK=0
+log_dir="/var/log/cloudadapter"
+tunnel_log="${log_dir}/tunnel.log"
+debug_log="./${mod}_debug.log"
+addresses="/tmp/addresses.$$"
+dates="/tmp/dates.$$"
+config="${path}/${mod}.conf"
+
+date=$(date +"%Y%m%d") 
+yesterday=$(date -d "yesterday" +"%Y%m%d")
+dayb4yesterday=$(date -d "-2 days" +"%Y%m%d")
+user=$(whoami)
+report_dir="/data/brmo/cloudadapter/reports"
+csv_report="${report_dir}/\${date}_cloudadapter_stats_${user}.csv"
+response_file="${log_dir}/${yesterday}01_brk_response.xml"
+dayb4yesterdays_response_file="${log_dir}/${dayb4yesterday}01_brk_response.xml"
+
+granularity="day"
+brkstat=0
+bagstat=0
+delay=0
+weekno=0
+fflg=0
+
+[[ -s ${config} ]] && source ${config}
+
+typeset -A dateArr
+typeset -A dbhash
+
+# Ansi colors
+Red="\033[31m"
+Green="\033[32m"
+Reset="\033[0m"
+
+# ==================================================================================================
+# usage
+# --------------------------------------------------------------------------------------------------
+function usage () {
+   cat << EOH
+
+$mod ${rev} built ${rev_date}
+
+Create a report from the Cloud Adapter tunnel.log file (or specified file with -f switch).
+In this version all messages with HTTP status 200 or 502 are taken into account.
+
+${mod} 
+
+usage:
+   ${mod} <option>
+
+   -c perform a check_mk check and gather statistics
+   -C perform a cross check with the database (mutually exclusive with the -H switch)
+   -f <path/filename> overrule the default '/var/log/cloudadapter/tunnel.log' file with specified file
+   -o <path> overrule the default CSV output filename '${csv_report}' with specified file
+   -w use week number instead of date format for CSV file
+   -e extended check: report diffeneces between log and database counts
+   -H hourly based statistics rather then daily based stats (default)
+   -x generate a CSV report in ${csv_report} 
+   -h usage notes
+
+                Copyright (c) 2019-2020 provincie Gelderland | I&A | RAS DBB
+                                 mailto: DBB@Gelderland.nl
+
+EOH
+   exit 1
+
+} # ------------------------------------------------------------------------------------------------
+
+# ==================================================================================================
+# Debug
+# --------------------------------------------------------------------------------------------------
+if [ ${SCRIPT_DEBUG} -eq 1 ]; then
+   exec 5> ${debug_log} 
+   BASH_XTRACEFD="5"
+   PS4='> DBG> $LINENO: '
+   set -x
+fi
+
+function debug() {
+   [[ ${SCRIPT_DEBUG} -eq 0 ]] && return
+   local message="${1}"
+   printf "DBG >>> %s\n" "${message}"
+
+} # ------------------------------------------------------------------------------------------------
+
+
+
+# ==================================================================================================
+# check_delay 
+# check is brk or bag messages have a delay of >1 day = warning or >2 days = critical
+# EXCEPT FOR: 
+# Saturday and Sunday, since there are NO devliveries on those days
+# On Monday the delivery should NOT EXCEED 75 hours!
+#
+# --------------------------------------------------------------------------------------------------
+function check_delay() {
+   # function get_stats() {
+   local _self_=${FUNCNAME[0]}
+   soort="${1}"
+
+   # ------------------------------------------------------------------
+   # check if there is a response file and if there was a BRK delivery:
+   if [ "${soort}" = "brk" ]; then
+      if [ -s ${response_file} ]; then
+         grep -q "brk:BestandenLijstGB/" ${response_file}
+         rv=${?}
+         if [ ${rv} -eq 0 ]; then
+            return 3
+         fi
+
+      # ------------------------------------------------------------------
+      # if not check if there is a yesterday's response file and if there
+      # was a BRK delivery...
+      elif [ -s ${dayb4yesterdays_response_file} ]; then
+         if [ $(date +"%H%M") -lt 1010 ]; then
+            grep -q "brk:BestandenLijstGB/" ${dayb4yesterdays_response_file}
+            rv=${?}
+            if [ ${rv} -eq 0 ]; then
+               return 3
+            fi
+         fi
+      fi
+   fi
+
+   date=$(grep "/${soort}" /var/log/cloudadapter/tunnel.log | tail -1 | awk '{ printf "%s\n", $4 }'| sed 's/\[//g')
+   if [ -z ${date} ]; then
+      date=$(grep "/${soort}" $(ls -1tr /var/log/cloudadapter/tunnel.log-*|tail -1)|tail -1|awk '{ printf "%s\n", $4 }'| sed 's/\[//g')
+      if [ -z ${date} ]; then
+         # -------------------------------------------------------------------------------
+         # 'soort' is not found in the last to tunnel.log files,
+         # so we set de delay to 3 days, which results in a warning or critical in checkmk
+         ((threedays=86400*3))
+         ((threedaysago=$(date +"%s")-threedays))
+         date=$(date -d "@${threedaysago}" +"%d/%b/%Y:%H:%M:%S") 
+      fi
+   fi 
+   epoch=$(date -d "$(echo ${date} | sed 's/\//-/g' | sed 's/:/ /')" +"%s") 
+   datum=$(echo ${date:0:11}|sed s'/\//-/g')
+
+   debug "${_self_} soort=>[${soort}] date=>[${date}] datum=>[${datum}] epoch=>[${epoch}]"
+
+   lastdate=$(date -d ${datum} +"%Y%m%d")
+   today=$(date +"%s")
+
+   ((daydiff=today-epoch))
+   ((hours=daydiff/3600))
+   day=$(date +"%a")
+
+   debug "${_self_} daydiff=>[${daydiff}] hours=>[${hours}] day=>[${day}]"
+
+   case ${day}
+   in
+       "Sat") return 0 ;;
+       "Sun") return 0 ;;
+       "Mon") if [ ${hours} -gt 75 ]; then
+                 return 2 
+              else
+                 return 0
+              fi ;;   
+   esac    
+   return ${hours}
+}
+
+# ==================================================================================================
+# get_stats
+# uses awk to filter only HTTP 200 and 502 messages
+# arguments:
+#   1 - message category (brk, bag etc.)
+#   2 - granularity of date format i.e. "day" or "hour" This results in the following specificatoin
+#        dd/Mon/yyyy
+#        dd/Mon/yyyy:hh24
+# --------------------------------------------------------------------------------------------------
+function get_stats() {
+   local _self_=${FUNCNAME[0]}
+   category="${1}"
+   granularity="${2:-"day"}" 
+
+   case ${granularity}
+   in
+      day) sslen=11 ;;
+     hour) sslen=14 ;;
+   esac
+
+   cat ${tunnel_log} | grep "${category}" | awk -v strlen=${sslen} '$9 == "200" || $9 == "502" { printf "%s\n",substr( $4,2,strlen ) }' | uniq > ${dates}
+   IFS=$'\r\n' GLOBIGNORE='*' command eval  'datelist=($(cat ${dates}))'
+
+   datecnt=${#datelist[@]}
+
+   ((datecnt-=1))
+   for i in "${datelist[@]}"
+   do
+      # debug "date => ${i}"
+      dateArr["${i}"]=$(cat ${tunnel_log} | awk '$9 == "200" || $9 == "502" { printf "%s\n",$0 }' | grep "${category}" | grep "${i}"| wc -l) 
+      debug "${_self_}:${category} Date Array for date ${i} => ${dateArr[${i}]}"
+   done
+
+} # ------------------------------------------------------------------------------------------------
+
+
+# ==================================================================================================
+# clean up ass. array but do NOT DESTROY
+# --------------------------------------------------------------------------------------------------
+function _init_hash() {
+   unset dbhash[STAGING_OK]
+   unset dbhash[STAGING_DUPLICAAT]
+}
+
+# ==================================================================================================
+# get_db_stats
+# uses the globals category and granularity groups by on message status
+# --------------------------------------------------------------------------------------------------
+function get_db_stats() {
+   local _self_="${FUNCNAME[0]}"
+   date="${1}" 
+   cat="${2}"
+
+   _init_hash
+   unset dbarr  
+
+   [[ ${CC} -eq 1 ]] && [[ "${granularity}" == "day" ]] && dbarr=($(psql ${DBNAME:-"brmo_staging"} ${PGUSER:-"postgres"} -A -t -c \
+      "select status , count(1) \
+       from laadproces \
+       where to_char( status_datum, 'dd/Mon/yyyy') = '${date}' and soort = '${cat}' \
+       group by status order by status desc"))
+
+   for val in "${dbarr[@]}"   
+   do
+      i=$(echo ${val} | cut -d '|' -f 1)
+      v=$(echo ${val} | cut -d '|' -f 2)   
+      dbhash[${i}]=${v} 
+   done
+      
+   for member in "${!dbhash[@]}"
+   do
+      debug "${_self_}: dbhash[${member}] => ${dbhash[${member}]}"
+   done
+
+   return 
+
+} # ------------------------------------------------------------------------------------------------
+
+# ==================================================================================================
+# get_stats
+# uses the globals datelist, dateArr, category and granularity
+# --------------------------------------------------------------------------------------------------
+function display_stats() {
+   local _self_="${FUNCNAME[0]}"
+   local totmsgcnt=0
+   local mmrcnt=0
+
+   for dt in "${datelist[@]}"
+   do
+      debug "${_self_}: Date Array for date ${dt} => ${dateArr[${dt}]}"
+   done 
+
+   hr 80 1
+   printf "| ${category} statistics\n"
+   hr 80 1
+
+   [[ ${CSV} -eq 1 ]] && printf "Datum;Soort;Aantal berichten"               >> ${csv_report} \
+                      && [[ ${CC} -eq 1 ]] && printf ";STAGING_OK"           >> ${csv_report} \
+                                           && printf ";STAGING_DUPLICAAT;\n" >> ${csv_report}
+
+   [[ ${CSV} -eq 1 ]] && [[ ${CC} -eq 0 ]]  && printf "\n"                   >> ${csv_report}
+
+   for dt in "${datelist[@]}"
+   do
+      # debug "${_self_}: Date Array for date ${dt} => ${dateArr[${dt}]}"
+      mcnt=${dateArr[${dt}]}
+
+      [[ ${CC} -eq 1 ]] && [[ "${granularity}" == "day" ]] && get_db_stats "${dt}" "${category}"
+      
+      printf "on ${dt} the CA received [${mcnt}] messages\n"
+
+      [[ ${CSV} -eq 1 ]] && printf "${dt};${category};${mcnt}"   >> "${csv_report}" 
+
+      [[ ${CSV} -eq 1 ]] && [[ ${CC} -eq 0 ]]  && printf "\n"    >> ${csv_report}
+
+      totmsgcnt=0
+      # reverse sort the status keys 
+      statuskeys=( $(echo ${!dbhash[@]} | tr ' ' $'\n' | sort -r) )
+
+      if [[ ${CC} -eq 1 ]] && [[ "${granularity}" == "day" ]]; then
+         for status in "${statuskeys[@]}"
+         do
+            mmrcnt=${dbhash[${status}]}
+            printf "   messages in '${DBNAME:-"brmo_staging"}::laadproces' table: ${status} => ${mmrcnt}\n"
+            ((totmsgcnt=totmsgcnt+mmrcnt))
+            if [ ${CC} -eq 1 ]; then
+               if [ "${status}" == "STAGING_OK" ]; then
+                  printf ";${dbhash[${status}]}"               >> ${csv_report} 
+               elif [ "${status}" == "STAGING_DUPLICAAT" ]; then
+                  printf ";${dbhash[${status}]}"               >> ${csv_report} 
+                  if [ ${EXCHK} -eq 1 ]; then
+                     ((diff=${totmsgcnt}-${mcnt})) 
+                     if [ ${diff} -ne 0 ]; then
+                        printf "   log and database records do not match [${diff}] ${Red}ERR${Reset}\n" 
+                     else
+                        printf "   log and database records do match     [${diff}] ${Green}OK${Reset}\n" 
+                     fi
+                  fi
+               fi
+               nl=0
+            fi
+         done
+         printf ";\n"               >> ${csv_report} 
+      fi
+
+      ((xmltot=xmltot+mcnt))
+   done
+
+   hr 80 1
+   printf "Total ${category} messages: ${xmltot:-0}\n"
+   hr 80 1
+   xmltot=0
+
+} # ------------------------------------------------------------------------------------------------
+
+# ==================================================================================================
+# check_delivery
+# Check is the delivery is bigger that 1 or 2 days and issue a warning or critical if so.
+# pseudo binary arithmic!
+# --------------------------------------------------------------------------------------------------
+function check_delivery() {
+   _self_="${FUNCNAME[0]}"
+
+   check_delay brk
+   rv_brk=${?}
+   check_delay bag
+   rv_bag=${?}
+
+   [[ ${rv_brk} -eq 3 ]] && delay=0
+   [[ ${rv_brk} -gt 24 ]] && ((delay=delay+1))
+   [[ ${rv_brk} -gt 48 ]] && ((delay=delay+10))
+   [[ ${rv_bag} -gt 24 ]] && ((delay=delay+100))
+   [[ ${rv_bag} -gt 48 ]] && ((delay=delay+1000))
+
+   debug "${_self_} rv_brk=>[${rv_brk}] rv_bag=>[${rv_bag}] delay=>[${delay}]"
+
+   case ${delay}
+   in
+         0) status=0
+            [[ ${rv_brk} -eq 3 ]] && msg="There has been NO BRK delivery! " 
+            return 0 ;;
+         1) status=1
+            msg="BRK delivery older than ${rv_brk} hours!" ;;
+        11) status=2
+            msg="BRK delivery older than ${rv_brk} hours!" ;;
+       100) status=1
+            msg="BAG delivery older than ${rv_bag} hours!" ;;
+       101) status=1
+            msg="BRK and BAG delivery older than ${rv_brk}/${rv_bag} hours!" ;;
+      1100) status=2
+            msg="BAG delivery older than ${rv_bag} hours!" ;;
+      1101) status=2
+            msg="BRK and BAG delivery older than ${rv_brk}/${rv_bag} hours!" ;;
+      1111) status=2
+            msg="BRK and BAG delivery older than ${rv_brk}/${rv_bag} hours!" ;;
+         *) status=2      
+            msg="BRK and BAG delivery older than ${rv_brk}/${rv_bag} hours!" ;;
+   esac
+
+   if [ ${status} -eq 1 ]; then
+      printf "1 Cloud-Adapter_Statistics brk=${brkcnt:-0}|bag=${bagcnt:-0} Warning - ${msg} Contact the Yenlo Servicedesk: mailto:support@yenlo.com\n"
+   elif [ ${status} -eq 2 ]; then
+      printf "2 Cloud-Adapter_Statistics brk=${brkcnt:-0}|bag=${bagcnt:-0} Critical - ${msg} Contact the Yenlo Servicedesk: support@yenlo.com\n"
+   fi 
+
+   exit ${status}
+}
+
+# ==================================================================================================
+# check_mk_stats
+# Get hourly stats for BAG and BRK messages for check_mk monitoring purposes
+# --------------------------------------------------------------------------------------------------
+function check_mk_stats() {
+   _self_="${FUNCNAME[0]}"
+   local log_file_state=0
+
+   brkcnt=$(cat ${tunnel_log} | grep brk | awk '$9 == '200' { printf "%s\n", substr($4, 2, 14) }'| grep $(date +"%d/%b/%Y:%H") | wc -l)
+   bagcnt=$(cat ${tunnel_log} | grep bag | awk '$9 == '200' { printf "%s\n", substr($4, 2, 14) }'| grep $(date +"%d/%b/%Y:%H") | wc -l)
+
+   check_delivery
+
+   log_file_state=$(check_log_file_state)
+
+   hour=$(date +"%k")
+   nexthour=${hour}
+   ((nexthour+=1))
+
+   # first check id there are zero byte log filesin /var/log/cloudadapter
+   if [ ${log_file_state} -eq 99 ]; then
+      printf "2 Cloud-Adapter_statistics - CRIT Cloud Adapter error, tunnel.log and adapter.log are empty: restart the Cloud Adapter (/etc/init.d/Cloudadapter stop / start\n"
+   # check if the Cloud adapter is still running...
+   elif [ $(/etc/init.d/Cloudadapter check_mk| awk '{ printf "%s",$1}') -eq 0 ]; then
+      # brkcnt=$(cat ${tunnel_log} | grep brk | awk '$9 == '200' { printf "%s\n", substr($4, 2, 14) }'| grep $(date +"%d/%b/%Y:%H") | wc -l)
+      # bagcnt=$(cat ${tunnel_log} | grep bag | awk '$9 == '200' { printf "%s\n", substr($4, 2, 14) }'| grep $(date +"%d/%b/%Y:%H") | wc -l)
+      printf "0 Cloud-Adapter_Statistics brk=${brkcnt:-0}|bag=${bagcnt:-0} OK - ${msg}The Cloud Adapter received ${brkcnt:-0} brk and ${bagcnt:-0} bag messages (between ${hour}:00 and ${nexthour}:00)\n"
+   else
+      printf "2 Cloud-Adapter_Statistics - CRIT No statistics, the Cloud Adapter is down!\n"
+   fi
+
+} # ------------------------------------------------------------------------------------------------
+
+# ==================================================================================================
+# check_log_file_state
+# check te sizes of adapter.log and tunnel.log and the previous ones id 0 bytes raise an error
+# --------------------------------------------------------------------------------------------------
+function check_log_file_state() {
+   _self_="${FUNCNAME[0]}"
+
+   if [[ ! -s ${log_dir}/tunnel.log.${date} ]] && \
+      [[ ! -s ${log_dir}/tunnel.log ]] && \
+      [[ ! -s ${log_dir}/adapter.log.${date} ]] && \
+      [[ ! -s ${log_dir}/adapter.log ]]; then
+      printf "99"
+   else 
+      printf "0"
+   fi
+
+}
+
+# ====== Commandline Parsing =======================================================================
+OPTERR=0
+
+while getopts ":bcxCDhHef:o:w" argv
+do
+   case ${argv}
+   in
+      D) # debug
+         debug=1 ;;
+      c) check_mk_stats
+         exit 0 ;;
+      f) fflg=1
+         tunnel_log="${OPTARG}" ;;
+      x) # generate Excel-CSV
+         CSV=1 ;;
+      C) # Cross check with PostgreSQL
+         [[ ${granularity} == "hour" ]] && printf "${mod} ERR - -H and -C switch are mutually exclusive\n" \
+                                        && exit 1
+         CC=1 ;;
+      b) BRIEF=1 ;;
+      o) csv_report="${OPTARG}" ;;
+      h) # usage
+         usage ;;
+      H) [[ ${CC} -eq 1 ]] && printf "${mod} ERR - -H and -C switch are mutually exclusive\n" \
+                            && exit 1
+         granularity="hour" ;;
+      e) # extended check
+         EXCHK=1 ;;
+      w) weekno=1 ;;
+     \?) # invalid option
+         printf "${mod}  ERR - invalid option -$OPTARG specified!\n" >&2
+         exit 1 ;;
+      :) # no mandatory argument
+         printf "${mod}  ERR - Option -$OPTARG requires an argument.\n" >&2
+         exit 1 ;;
+
+   esac
+done
+
+# Determine the CSV filename based on the specified flags
+[[ ${weekno} -eq 1 ]] && date=$(date +"%V") 
+[[ ${weekno} -eq 1 ]] && [[ ${fflg} -eq 1 ]] && dd=$(echo ${tunnel_log} | cut -d '-' -f2) \
+                                             && date=$(date -d "${dd}" +"%V")
+
+csv_report=$(eval echo ${csv_report})
+[[ ${CSV} -eq 1 ]] && cat /dev/null > ${csv_report} 
+ 
+# ====== main scope ================================================================================
+source /home/postgres/global/lib/libbash.sh      1>/dev/null 2>&1
+
+if [ -s ${tunnel_log} ]; then
+   tl_lines=$(cat ${tunnel_log}|wc -l)
+   tls_lines=$(cat ${tunnel_log} | awk '$9 == 200 || $9 == "502" { msg += 1 } END { printf "%d", msg }')
+
+   # IP address stats
+   cat ${tunnel_log} | grep "${category}" | awk '{ printf "%s\n", $1 }'| uniq > ${addresses}
+   IFS=$'\r\n' GLOBIGNORE='*' command eval  'remoteip=($(cat ${addresses}))'
+
+   ipcnt=${#remoteip[@]}
+
+   echo
+   hr 80 1
+   printf "| Yenlo Cloud Adapter statistics on $(date)\n"
+   printf "| Remote IP address: ${remoteip[0]} \n"
+   [[ ! -z ${remoteip[1]} ]] && printf "| Remote IP address: ${remoteip[1]} \n"
+   [[ ! -z ${remoteip[2]} ]] && printf "| Remote IP address: ${remoteip[2]} \n"
+   hr 80 1
+
+   if [ ${BRIEF} -eq 0 ]; then
+
+      get_stats "brk" "${granularity}" 
+      display_stats
+      
+      [[ ${CSV} -eq 1 ]] && printf "\n"  >> ${csv_report}
+      get_stats "bag" "${granularity}" 
+      display_stats
+   
+      [[ ${CSV} -eq 1 ]] && printf "\ntotal successful (http 200/502) messages in CA log:;;${tls_lines}\n" >> ${csv_report} 
+      printf "\nTotal successful (http 200/502) messages in ${tunnel_log}: %s\n\n" "${tls_lines}"
+   else
+      ((X=tl_lines-tls_lines))
+      printf "Total number of unsuccessful messages (<> HTTP 200): %d\n" ${X} 
+      cat ${tunnel_log} | awk \
+      '$9 == "200" { if ( $7 == "/bag" ) { bag += 1 } if ( $7 == "/brk" ) { brk += 1 } { msg += 1} } END { printf "BRK messages: %d\nBAG messages %d\nTotal successful (HTTP 200) messages: %d\n",brk,bag,msg }'
+   fi
+   echo
+fi
+
+# clean up
+rm -f ${addresses}
+rm -f ${dates}
+#------ end of ca_stats ---------------------------------------------------------------------------
