@@ -1,0 +1,59 @@
+#!/bin/bash
+# ==================================================================================================== 
+#
+#      File: chk_swap
+#      Date: Wed Oct 31 11:41:04 CET 2018
+#      What: Local check for check_mk to report swapspace usage and raise the appropriate status
+#       Who: Gert J. Willems
+#
+#  Revision: 0.1
+#
+# ==================================================================================================== 
+# set -xv
+
+warning_threshold=10
+critical_threshold=5
+
+# ==================================================================================================== 
+function debug() {
+   msg="${@}"
+   if [[ ${SCRIPT_DEBUG} -eq 1 ]]; then
+      printf "DEBUG >> ${msg}\n"
+   fi
+}
+ 
+# ==================================================================================================== 
+typeset -A SwapSpace
+SwapSpace=([total]=$(free -m|grep -w Swap:|awk '{ printf "%s",$2}') [used]=$(free -m|grep -w Swap:|\
+awk '{ printf "%s",$3}'))
+SwapSpace+=([free]=$(expr ${SwapSpace[total]} - ${SwapSpace[used]})) 
+
+debug "Total swapspace = [${SwapSpace[total]}] MB"
+debug "Used  swapspace = [${SwapSpace[used]}] MB"
+debug "Free  swapspace = [${SwapSpace[free]}] MB"
+
+pct_free=$(printf "%3.2f" "$(echo "${SwapSpace[free]} / ${SwapSpace[total]} * 100"|bc -l)" )
+# ====== main scope ==================================================================================
+debug "Free percent = ${pct_free}"
+
+pct_free_int=$(printf "%0.0f" "${pct_free}")
+data="pct_free=${pct_free}, used=${SwapSpace[used]} MB, free=${SwapSpace[free]} MB,\
+ total=${SwapSpace[total]} MB"
+# pct_free_flt=$(printf "%0.0f" "${pct_free}")
+
+if [[ ${pct_free_int} -lt ${critical_threshold} ]]; then
+   status=2
+   status_txt="CRIT - Swapspace exhausted! ${data}"
+elif [[ ${pct_free_int} -lt ${warning_threshold} ]]; then
+   status=1
+   status_txt="WARN - Swapspace needs attention! ${data}\n"
+else 
+   status=0
+   status_txt="OK - Swapspace OK ${data}\n"
+fi
+
+# printf "%s Linux_Swapspace pct_free=${pct_free}|total=${SwapSpace[total]}|used=${SwapSpace[used]}\
+# |free=${SwapSpace[free]} %s\n" "${status}" "${status_txt}"
+printf "%s Linux_Swapspace used=${SwapSpace[used]}|free=${SwapSpace[free]}\
+|total=${SwapSpace[total]} %s\n" "${status}" "${status_txt}"
+# ----- end of chk_swap ------------------------------------------------------------------------------

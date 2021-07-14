@@ -1,0 +1,141 @@
+#!/bin/bash
+# ============================================================================== 
+#
+#      File: ddbench
+#      Date: Wed Nov  1 08:34:40 CET 2017
+#      What: perform a sort of disk benchmark with linux 'dd'
+#       WHo: Gert J. Willems
+#
+# ------------------------------------------------------------------------------ 
+# 
+# ==============================================================================
+# History:
+# Date       Rev   Author        What
+# ---------- ----- ------------- -----------------------------------------------
+# 01-11-2017 0.1   gjwillems     created
+# 01-11-2017 0.2   gjwillems     commandline parsing for directories
+# 02-11-2017 0.3   gjwillems     run_dd function, averages added
+#
+# ============================================================================== 
+#
+# set -xv
+mod=$(basename ${0})
+SC_REV="0.3"
+SC_REV_DATE="Thu Nov  2 12:54:30 CET 2017"
+
+hostname=$(hostname -s)
+report=${PWD}/${hostname}_ddbench_$(date +"%Y%m%d").txt
+benchmarkfile="migratie-testfile-"
+
+# ============================================================================== 
+# help
+# ------------------------------------------------------------------------------ 
+function usage () {
+   cat << EOH
+
+${mod} ${SC_REV} built ${SC_REV_DATE}
+
+usage:
+    ${mod} -d base-test-directory -D second-base-directory [-i <iterations>]
+
+    base-directory  = is the main directory where the test files are created
+    second-base dir = is the location where for the last run the test files
+                      are created, based on a file read from the primary
+                      directory.
+    iterations      - number of cycles to perform
+
+    dd is performed with 1G block size 128K block size and 1M block size
+
+    dd if=/dev/zero of=${benchmarkfile}-1G bs=1G count=1 oflag=dsync conv=fdatasync
+   
+EOH
+}
+
+# ============================================================================== 
+# run the 'dd' command
+# ------------------------------------------------------------------------------ 
+function run_dd() {
+   blocksize=${1} 
+   blocks=${2}
+   readtest=${3} 
+
+   [[ ${readtest} -eq 0 ]] &&  printf "\ndd if=/dev/zero \
+of=${benchmarkfile}-${blocksize} \
+bs=${blocksize} count=${blocks} oflag=dsync conv=fdatasync\n" \
+   | tee -a ${report} 
+
+   [[ ${readtest} -eq 1 ]] && printf "\ndd if=${benchmarkfile}-${blocksize} \
+of=${scd_base_directory}/${benchmarkfile}-${blocksize} \
+bs=${blocksize} count=${blocks} oflag=dsync conv=fdatasync \n" | tee -a ${report}
+
+   cat /dev/null > $$.tmp
+
+   printf "please wait for the ${blocksize} run [${iterations}]...\n"
+   for i in $(seq 1 ${iterations})
+   do
+      printf "${i} of ${iterations}"
+      [[ ${readtest} -eq 0 ]] && dd if=/dev/zero of=${benchmarkfile}-${blocksize} \
+         bs=${blocksize} \
+         count=${blocks} oflag=dsync conv=fdatasync  1>>$$.tmp 2>&1
+      [[ ${readtest} -eq 1 ]] && dd if=${benchmarkfile}-${blocksize} \
+         of=${scd_base_directory}/${benchmarkfile}-${blocksize} \
+         bs=${blocksize} \
+         count=${blocks} oflag=dsync conv=fdatasync  1>>$$.tmp 2>&1
+      echo
+   done
+   
+   cat $$.tmp | grep -iwv "records" >> ${report}
+   avg_sec=$(cat $$.tmp | grep -iwv "records" | awk '{ sec+=$6 } END { print sec/NR } ')
+   avg_mbs=$(cat $$.tmp | grep -iwv "records" | awk '{ mbs+=$8 } END { print mbs/NR } ')
+
+   printf "Averages:\n"                     | tee -a ${report}
+   printf "average seconds: [${avg_sec}]\n" | tee -a ${report}
+   printf "average MB's   : [${avg_mbs}]\n" | tee -a ${report}
+
+
+   return 0
+}
+
+# ===== commandline parser =====================================================
+while getopts "d:D:i:h" argv
+do
+   case ${argv}
+   in
+      d) base_directory=${OPTARG} ;;
+      D) scd_base_directory=${OPTARG} ;;
+      i) iterations=${OPTARG} ;;
+      h) usage ;;
+   esac
+done
+
+# ===== main scope =============================================================
+[[ -z ${base_directory} ]] && echo base-directory is madatory && exit 1
+[[ -z ${scd_base_directory} ]] && echo 2nd-base-directory is madatory && exit 1
+
+cd ${base_directory}
+
+printf "+==============================================================================+\n" \
+| tee ${report}
+printf "| ${mod} revision ${SC_REV} built ${SC_REV_DATE} \n|\n"  | tee -a ${report}
+printf "| basedirectory      : [${base_directory}] \n"           | tee -a ${report}
+printf "| testfile base      : [${benchmarkfile}] \n"            | tee -a ${report}
+printf "| 2nd base directory : [${scd_base_directory}] \n"       | tee -a ${report}
+printf "| iterations         : ${iterations} \n|\n"              | tee -a ${report}
+printf "| performing ${mod} on ${hostname}@$(date) \n"           | tee -a ${report}
+printf "+==============================================================================+\n\n" \
+| tee -a ${report}
+
+#run_dd 1G 1 0
+
+run_dd 1M 1000 0
+
+#run_dd 128K 8192 0
+
+run_dd 1M 1000 1
+
+# remove temporary files
+
+rm -f $$.tmp \
+      ${scd_base_directory}/${benchmarkfile}-${blocksize} \
+      ${benchmarkfile}-${blocksize} 
+# ----- end of ddbench
