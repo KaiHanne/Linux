@@ -10,7 +10,7 @@
 #
 # ============================================================================== 
 use strict;
-use lib "$FindBin::Bin/home/postgres/global/lib";
+use lib "$FindBin::Bin/home/<USER>/global/lib";
 use Timex;
 
 sub getTimestamp() {
